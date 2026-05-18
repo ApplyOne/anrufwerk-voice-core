@@ -25,7 +25,7 @@ async function analyzeWithOpenAI(text) {
       "Content-Type": "application/json",
     },
     body: JSON.stringify({
-      model: "gpt-4.1-mini",
+      model: "gpt-4o-mini",
       temperature: 0.1,
       messages: [
         {
@@ -53,7 +53,9 @@ Notfall = Wasserleck, Rohrbruch, Überschwemmung, Heizung komplett ausgefallen, 
   });
 
   const data = await response.json();
-  return data.choices?.[0]?.message?.content || "{}";
+  console.log("FULL OPENAI RESPONSE:", JSON.stringify(data));
+
+return data.choices?.[0]?.message?.content || "{}";
 }
 
 app.get("/", (req, res) => {
