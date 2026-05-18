@@ -14,7 +14,7 @@ const requiredEnv = [
   "TWILIO_ACCOUNT_SID",
   "TWILIO_AUTH_TOKEN",
   "TWILIO_PHONE_NUMBER",
-  "GOOGLE_APPLICATION_CREDENTIALS",
+  "GOOGLE_CREDENTIALS_JSON",
 ];
 
 for (const key of requiredEnv) {
@@ -24,11 +24,10 @@ for (const key of requiredEnv) {
   }
 }
 
-if (!fs.existsSync(process.env.GOOGLE_APPLICATION_CREDENTIALS)) {
-  console.error("Google JSON Datei nicht gefunden.");
-  process.exit(1);
-}
+const googlePath = "/tmp/google.json";
+fs.writeFileSync(googlePath, process.env.GOOGLE_CREDENTIALS_JSON);
+process.env.GOOGLE_APPLICATION_CREDENTIALS = googlePath;
 
 console.log("Alle Environment Variablen vorhanden.");
-console.log("Google Credentials gefunden.");
+console.log("Google Credentials aus Railway Variable erstellt.");
 console.log("Voice Core bereit.");
