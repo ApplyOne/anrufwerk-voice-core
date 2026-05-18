@@ -55,8 +55,15 @@ emergency: true|false
 summary: kurze Zusammenfassung
 reply: professionelle kurze Antwort
 
+Wichtig für reply:
+- Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
+- Du bist die Annahmestelle.
+- Bei Notfällen sage: Ich nehme Ihre Angaben auf und leite es sofort weiter.
+- Frage in reply noch NICHT nach Name oder Telefonnummer. Das macht das System danach separat.
+
 Notfall:
 - Wasserleck
+- Wasser läuft aus
 - Überschwemmung
 - Rohrbruch
 - Stromausfall
@@ -89,7 +96,16 @@ confidence: low|medium|high
 Regeln:
 - Schweizer Mobile Nummern beginnen oft mit 076, 077, 078 oder 079.
 - Wörter wie null, nul, zero = 0.
-- sieben = 7, neun = 9, vier = 4, zwei = 2, fünf = 5, drei = 3, eins = 1, sechs = 6, acht = 8.
+- eins = 1
+- ein = 1
+- zwei = 2
+- drei = 3
+- vier = 4
+- fünf = 5
+- sechs = 6
+- sieben = 7
+- acht = 8
+- neun = 9
 - Wenn eine Nummer wie "null sieben neun vier zwei fünf null null zwei drei" erkannt wird, gib 0794250023 aus.
 - Wenn der Text unsicher ist, confidence low.
       `.trim(),
@@ -113,6 +129,7 @@ app.post("/", (req, res) => {
   console.log("Twilio Call erhalten:", req.body?.CallSid);
 
   res.type("text/xml");
+
   res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/speech" method="POST">
@@ -120,8 +137,15 @@ app.post("/", (req, res) => {
       Guten Tag. Bitte sagen Sie kurz, was Ihr Anliegen ist.
     </Say>
   </Gather>
+
+  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/speech" method="POST">
+    <Say language="de-DE" voice="Polly.Vicki">
+      Ich habe leider nichts verstanden. Bitte sagen Sie Ihr Anliegen nochmals kurz.
+    </Say>
+  </Gather>
+
   <Say language="de-DE" voice="Polly.Vicki">
-    Ich habe leider nichts verstanden. Bitte rufen Sie nochmals an.
+    Entschuldigung, ich konnte Sie nicht verstehen. Bitte versuchen Sie es später nochmals.
   </Say>
 </Response>
   `.trim());
@@ -143,14 +167,15 @@ app.post("/speech", async (req, res) => {
     console.error("OpenAI Fehler:", error.message);
     aiResult = {
       emergency: false,
-      reply: "Vielen Dank. Ich habe Ihr Anliegen erfasst.",
+      reply: "Vielen Dank. Ich nehme Ihr Anliegen auf.",
     };
   }
 
   const reply =
-    aiResult.reply || "Vielen Dank. Ich habe Ihr Anliegen erfasst.";
+    aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
 
   res.type("text/xml");
+
   res.send(`
 <Response>
   <Say language="de-DE" voice="Polly.Vicki">
@@ -163,9 +188,17 @@ app.post("/speech", async (req, res) => {
     </Say>
   </Gather>
 
+  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/name" method="POST">
+    <Say language="de-DE" voice="Polly.Vicki">
+      Ich habe den Namen leider nicht verstanden. Bitte sagen Sie nur Ihren Vor- und Nachnamen.
+    </Say>
+  </Gather>
+
   <Say language="de-DE" voice="Polly.Vicki">
-    Ich habe den Namen leider nicht verstanden. Bitte rufen Sie nochmals an.
+    Ich konnte den Namen leider nicht sicher erfassen. Ich fahre trotzdem fort.
   </Say>
+
+  <Redirect method="POST">/ask-phone</Redirect>
 </Response>
   `.trim());
 });
@@ -177,6 +210,17 @@ app.post("/name", (req, res) => {
   console.log("Name Confidence:", req.body?.Confidence);
 
   res.type("text/xml");
+
+  res.send(`
+<Response>
+  <Redirect method="POST">/ask-phone</Redirect>
+</Response>
+  `.trim());
+});
+
+app.post("/ask-phone", (req, res) => {
+  res.type("text/xml");
+
   res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
@@ -186,8 +230,16 @@ app.post("/name", (req, res) => {
     </Say>
   </Gather>
 
+  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
+    <Say language="de-DE" voice="Polly.Vicki">
+      Ich habe die Telefonnummer leider nicht verstanden.
+      Bitte sagen Sie nur die Telefonnummer langsam, Ziffer für Ziffer.
+    </Say>
+  </Gather>
+
   <Say language="de-DE" voice="Polly.Vicki">
-    Ich habe die Telefonnummer leider nicht verstanden. Bitte rufen Sie nochmals an.
+    Ich konnte die Telefonnummer leider nicht sicher erfassen.
+    Ihr Anliegen wurde trotzdem aufgenommen.
   </Say>
 </Response>
   `.trim());
@@ -221,24 +273,45 @@ app.post("/phone", async (req, res) => {
     !phoneResult.phone_digits
   ) {
     res.type("text/xml");
+
     res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
     <Say language="de-DE" voice="Polly.Vicki">
       Entschuldigung, ich habe die Telefonnummer nicht sicher verstanden.
-      Bitte wiederholen Sie sie langsam, Ziffer für Ziffer.
+      Bitte sagen Sie sie nochmals langsam, Ziffer für Ziffer.
+      Zum Beispiel: null sieben neun vier zwei fünf null null zwei drei.
     </Say>
   </Gather>
+
+  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
+    <Say language="de-DE" voice="Polly.Vicki">
+      Ich versuche es nochmals. Bitte nennen Sie nur die Telefonnummer.
+    </Say>
+  </Gather>
+
+  <Say language="de-DE" voice="Polly.Vicki">
+    Danke. Wir haben Ihr Anliegen aufgenommen.
+    Falls Ihre Telefonnummer nicht korrekt erfasst wurde, rufen wir Sie über die angezeigte Anrufernummer zurück, sofern diese verfügbar ist.
+  </Say>
 </Response>
     `.trim());
+
     return;
   }
 
+  const readablePhone =
+    phoneResult.phone_blocks && phoneResult.phone_blocks.length
+      ? phoneResult.phone_blocks.join(" ")
+      : phoneResult.phone_digits;
+
   res.type("text/xml");
+
   res.send(`
 <Response>
   <Say language="de-DE" voice="Polly.Vicki">
-    Vielen Dank. Ich habe Ihre Telefonnummer erfasst. Wir melden uns so schnell wie möglich bei Ihnen.
+    Vielen Dank. Ich habe Ihre Telefonnummer als ${readablePhone} erfasst.
+    Wir melden uns so schnell wie möglich bei Ihnen.
   </Say>
 </Response>
   `.trim());
