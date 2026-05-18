@@ -27,10 +27,8 @@ app.post("/", (req, res) => {
   res.type("text/xml");
   res.send(`
 <Response>
-  <Say language="de-DE" voice="alice">Guten Tag. Hier ist der telefonische Assistent. Wie kann ich Ihnen helfen?</Say>
-  <Pause length="1"/>
-  <Say language="de-DE" voice="alice">Vielen Dank. Dies ist ein erster Verbindungstest.</Say>
-</Response>
+<Say language="de-DE" voice="Polly.Vicki">Guten Tag. Hier ist der telefonische Assistent. Wie kann ich Ihnen helfen?</Say>  <Pause length="1"/>
+<Say language="de-DE" voice="Polly.Vicki">Vielen Dank. Dies ist ein erster Verbindungstest.</Say></Response>
   `.trim());
 });
 
