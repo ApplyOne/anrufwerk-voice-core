@@ -18,7 +18,7 @@ const PORT = process.env.PORT || 8080;
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-async function analyzeWithOpenAI(text) {
+async function callOpenAI(messages) {
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
@@ -28,10 +28,21 @@ async function analyzeWithOpenAI(text) {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content: `
+      messages,
+    }),
+  });
+
+  const data = await response.json();
+  console.log("FULL OPENAI RESPONSE:", JSON.stringify(data));
+
+  return data.choices?.[0]?.message?.content || "{}";
+}
+
+async function analyzeIssue(text) {
+  return callOpenAI([
+    {
+      role: "system",
+      content: `
 Du bist der Telefonassistent eines Schweizer Sanitär-, Heizungs- und Elektrobetriebs.
 
 Analysiere den Text.
@@ -50,19 +61,44 @@ Notfall:
 - Rohrbruch
 - Stromausfall
 - Heizung komplett ausgefallen
-          `.trim(),
-        },
-        {
-          role: "user",
-          content: text,
-        },
-      ],
-    }),
-  });
+      `.trim(),
+    },
+    {
+      role: "user",
+      content: text,
+    },
+  ]);
+}
 
-  const data = await response.json();
-  console.log("FULL OPENAI RESPONSE:", JSON.stringify(data));
-  return data.choices?.[0]?.message?.content || "{}";
+async function extractPhone(text) {
+  return callOpenAI([
+    {
+      role: "system",
+      content: `
+Du extrahierst Schweizer Telefonnummern aus schlecht transkribierter Sprache.
+
+Antworte NUR als JSON.
+
+Felder:
+raw_text: originaler Text
+phone_digits: nur Ziffern, ohne Leerzeichen
+phone_blocks: Array mit Blöcken, z.B. ["079","425","00","23"]
+is_valid_swiss_mobile: true|false
+confidence: low|medium|high
+
+Regeln:
+- Schweizer Mobile Nummern beginnen oft mit 076, 077, 078 oder 079.
+- Wörter wie null, nul, zero = 0.
+- sieben = 7, neun = 9, vier = 4, zwei = 2, fünf = 5, drei = 3, eins = 1, sechs = 6, acht = 8.
+- Wenn eine Nummer wie "null sieben neun vier zwei fünf null null zwei drei" erkannt wird, gib 0794250023 aus.
+- Wenn der Text unsicher ist, confidence low.
+      `.trim(),
+    },
+    {
+      role: "user",
+      content: text,
+    },
+  ]);
 }
 
 app.get("/", (req, res) => {
@@ -100,7 +136,7 @@ app.post("/speech", async (req, res) => {
   let aiResult = {};
 
   try {
-    const raw = await analyzeWithOpenAI(speechText);
+    const raw = await analyzeIssue(speechText);
     console.log("AI Raw Result:", raw);
     aiResult = JSON.parse(raw);
   } catch (error) {
@@ -145,8 +181,8 @@ app.post("/name", (req, res) => {
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
     <Say language="de-DE" voice="Polly.Vicki">
-      Danke. Bitte sagen Sie jetzt Ihre Telefonnummer langsam und in Blöcken.
-      Zum Beispiel: null sieben neun, vier zwei fünf, null null, zwei drei.
+      Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.
+      Zum Beispiel: null sieben neun vier zwei fünf null null zwei drei.
     </Say>
   </Gather>
 
@@ -157,17 +193,52 @@ app.post("/name", (req, res) => {
   `.trim());
 });
 
-app.post("/phone", (req, res) => {
+app.post("/phone", async (req, res) => {
   const phoneText = req.body?.SpeechResult || "";
 
   console.log("Phone Result:", phoneText);
   console.log("Phone Confidence:", req.body?.Confidence);
 
+  let phoneResult = {};
+
+  try {
+    const rawPhone = await extractPhone(phoneText);
+    console.log("Phone AI Raw Result:", rawPhone);
+    phoneResult = JSON.parse(rawPhone);
+    console.log("Phone Extracted:", JSON.stringify(phoneResult));
+  } catch (error) {
+    console.error("Phone Extraction Fehler:", error.message);
+    phoneResult = {
+      phone_digits: "",
+      confidence: "low",
+      is_valid_swiss_mobile: false,
+    };
+  }
+
+  if (
+    !phoneResult.is_valid_swiss_mobile ||
+    phoneResult.confidence === "low" ||
+    !phoneResult.phone_digits
+  ) {
+    res.type("text/xml");
+    res.send(`
+<Response>
+  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
+    <Say language="de-DE" voice="Polly.Vicki">
+      Entschuldigung, ich habe die Telefonnummer nicht sicher verstanden.
+      Bitte wiederholen Sie sie langsam, Ziffer für Ziffer.
+    </Say>
+  </Gather>
+</Response>
+    `.trim());
+    return;
+  }
+
   res.type("text/xml");
   res.send(`
 <Response>
   <Say language="de-DE" voice="Polly.Vicki">
-    Vielen Dank. Ich habe Ihre Angaben aufgenommen. Wir melden uns so schnell wie möglich bei Ihnen.
+    Vielen Dank. Ich habe Ihre Telefonnummer erfasst. Wir melden uns so schnell wie möglich bei Ihnen.
   </Say>
 </Response>
   `.trim());
