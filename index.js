@@ -17,6 +17,45 @@ const PORT = process.env.PORT || 8080;
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
+async function analyzeWithOpenAI(text) {
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4.1-mini",
+      temperature: 0.1,
+      messages: [
+        {
+          role: "system",
+          content: `
+Du bist der Telefonassistent eines Schweizer Sanitär-, Heizungs- und Elektrobetriebs.
+Analysiere den Anruftext.
+Antworte nur als JSON.
+
+Felder:
+intent: sanitaer|heizung|elektro|sonstiges
+emergency: true|false
+summary: kurze Zusammenfassung
+reply: kurze professionelle Antwort auf Hochdeutsch
+
+Notfall = Wasserleck, Rohrbruch, Überschwemmung, Heizung komplett ausgefallen, Stromausfall.
+          `.trim(),
+        },
+        {
+          role: "user",
+          content: text,
+        },
+      ],
+    }),
+  });
+
+  const data = await response.json();
+  return data.choices?.[0]?.message?.content || "{}";
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("Anrufwerk Voice Core läuft.");
 });
@@ -35,14 +74,31 @@ app.post("/", (req, res) => {
   `.trim());
 });
 
-app.post("/speech", (req, res) => {
-  console.log("Speech Result:", req.body?.SpeechResult);
+app.post("/speech", async (req, res) => {
+  const speechText = req.body?.SpeechResult || "";
+
+  console.log("Speech Result:", speechText);
   console.log("Confidence:", req.body?.Confidence);
+
+  let aiResult = {};
+  try {
+    const raw = await analyzeWithOpenAI(speechText);
+    console.log("AI Raw Result:", raw);
+    aiResult = JSON.parse(raw);
+  } catch (error) {
+    console.error("OpenAI Fehler:", error.message);
+    aiResult = {
+      emergency: false,
+      reply: "Vielen Dank. Ich habe Ihr Anliegen erfasst.",
+    };
+  }
+
+  const reply = aiResult.reply || "Vielen Dank. Ich habe Ihr Anliegen erfasst.";
 
   res.type("text/xml");
   res.send(`
 <Response>
-  <Say language="de-DE" voice="Polly.Vicki">Vielen Dank. Ich habe Ihr Anliegen erfasst.</Say>
+  <Say language="de-DE" voice="Polly.Vicki">${reply}</Say>
 </Response>
   `.trim());
 });
