@@ -1,6 +1,7 @@
 require("dotenv").config();
 
 const fs = require("fs");
+const express = require("express");
 
 const {
   defineAgent,
@@ -8,6 +9,18 @@ const {
 } = require("@livekit/agents");
 
 const { openai } = require("@livekit/agents-plugin-openai");
+
+const app = express();
+
+const PORT = process.env.PORT || 3000;
+
+app.get("/", (req, res) => {
+  res.send("Anrufwerk Voice Core läuft.");
+});
+
+app.listen(PORT, () => {
+  console.log(`HTTP Server läuft auf Port ${PORT}`);
+});
 
 console.log("Anrufwerk Voice Core startet...");
 
