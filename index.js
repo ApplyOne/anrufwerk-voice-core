@@ -131,8 +131,8 @@ Regeln:
   "null sieben neun vier zwei fünf null null zwei drei"
   erkannt wird,
   gib 0794250023 aus.
-- Wenn der Text unsicher ist:
-  confidence low.
+- Wenn die Nummer korrekt extrahiert werden konnte,
+  darf confidence auch low sein.
       `.trim(),
     },
     {
@@ -332,6 +332,7 @@ app.post("/ask-phone", (req, res) => {
   >
     <Say language="de-DE" voice="Polly.Vicki">
       Danke.
+
       Bitte sagen Sie Ihre Telefonnummer langsam,
       Ziffer für Ziffer.
 
@@ -409,11 +410,15 @@ app.post("/phone", async (req, res) => {
     };
   }
 
-  if (
-    !phoneResult.is_valid_swiss_mobile ||
-    phoneResult.confidence === "low" ||
-    !phoneResult.phone_digits
-  ) {
+  const phoneDigits =
+    phoneResult.phone_digits || "";
+
+  const isValidSwissMobile =
+    phoneResult.is_valid_swiss_mobile &&
+    phoneDigits.length === 10 &&
+    phoneDigits.startsWith("07");
+
+  if (!isValidSwissMobile) {
     res.type("text/xml");
 
     res.send(`
