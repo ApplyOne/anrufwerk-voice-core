@@ -58,7 +58,7 @@ function twilioSay(text) {
 
 function stableGather(action, text) {
   return `
-<Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST">
+<Gather input="speech" language="de-CH" timeout="7" speechTimeout="auto" action="${action}" method="POST">
   ${twilioSay(text)}
 </Gather>
   `.trim();
@@ -74,21 +74,26 @@ function elevenPlay(req, text, config) {
   return `<Play>${escapeXml(url)}</Play>`;
 }
 
-function premiumSpeakThenRedirect(req, text, redirectPath, config) {
+function premiumSpeak(req, text, nextPath, config) {
   return `
 <Response>
   ${elevenPlay(req, text, config)}
-  <Redirect method="POST">${redirectPath}</Redirect>
+  <Redirect method="POST">${nextPath}</Redirect>
 </Response>
   `.trim();
 }
 
-function premiumListen(action) {
+function premiumListen(action, repeatPath) {
   return `
 <Response>
-  <Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST"></Gather>
+  <Gather input="speech" language="de-CH" timeout="8" speechTimeout="auto" action="${action}" method="POST"></Gather>
+  <Redirect method="POST">${repeatPath}</Redirect>
 </Response>
   `.trim();
+}
+
+function twimlRedirect(path) {
+  return `<Response><Redirect method="POST">${path}</Redirect></Response>`;
 }
 
 async function loadVoiceConfig(toNumber) {
@@ -130,7 +135,6 @@ async function callOpenAI(messages) {
 
   const data = await response.json();
   let content = data.choices?.[0]?.message?.content || "{}";
-
   return content.replace(/```json/g, "").replace(/```/g, "").trim();
 }
 
@@ -154,11 +158,9 @@ Stil:
 - Antwortlänge: ${config?.voice?.response_length || "medium"}
 - Freundlichkeit: ${config?.voice?.friendliness || "high"}
 - Natürlichkeit: ${config?.voice?.naturalness_level || "standard"}
-- Dialog-Stil: ${config?.voice?.conversation_style || "effizient"}
 
 Regeln:
 - Antworte kurz und natürlich.
-- Keine langen Robotertexte.
 - Du bist die Annahmestelle.
 - Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
 - Bei Notfällen sage: "Ich nehme Ihre Angaben auf und leite es sofort weiter."
@@ -308,9 +310,8 @@ app.get("/tts-elevenlabs", async (req, res) => {
     );
 
     if (!response.ok) {
-      const errorText = await response.text();
       console.error("ElevenLabs TTS Fehler Status:", response.status);
-      console.error("ElevenLabs TTS Fehler Body:", errorText);
+      console.error("ElevenLabs TTS Fehler Body:", await response.text());
       res.status(500).send("ElevenLabs TTS Fehler");
       return;
     }
@@ -349,6 +350,7 @@ app.post("/", async (req, res) => {
     config,
     organization_id: config?.organization_id || process.env.ORGANIZATION_ID,
     transcript: [],
+    prompts: {},
     created_at: new Date().toISOString(),
   };
 
@@ -366,7 +368,6 @@ app.post("/", async (req, res) => {
   console.log("Voice Mode:", {
     provider: config?.voice?.provider,
     quality_mode: config?.voice?.quality_mode,
-    elevenlabs_available: config?.voice?.elevenlabs_available,
     premium_active: isPremiumMode(config),
   });
 
@@ -377,7 +378,8 @@ app.post("/", async (req, res) => {
     }. Bitte sagen Sie kurz, was Ihr Anliegen ist.`;
 
   if (isPremiumMode(config)) {
-    res.send(premiumSpeakThenRedirect(req, greeting, "/listen-speech", config));
+    callSessions[callSid].prompts.speech = greeting;
+    res.send(premiumSpeak(req, greeting, "/listen-speech", config));
     return;
   }
 
@@ -390,26 +392,66 @@ app.post("/", async (req, res) => {
 
 app.post("/listen-speech", (req, res) => {
   res.type("text/xml");
-  res.send(premiumListen("/speech"));
+  res.send(premiumListen("/speech", "/repeat-speech"));
+});
+
+app.post("/repeat-speech", (req, res) => {
+  const callSid = req.body?.CallSid;
+  const session = callSessions[callSid];
+  const prompt =
+    session?.prompts?.speech ||
+    "Bitte sagen Sie kurz, was Ihr Anliegen ist.";
+
+  res.type("text/xml");
+  res.send(premiumSpeak(req, prompt, "/listen-speech", session?.config));
 });
 
 app.post("/listen-name", (req, res) => {
   res.type("text/xml");
-  res.send(premiumListen("/name"));
+  res.send(premiumListen("/name", "/repeat-name"));
+});
+
+app.post("/repeat-name", (req, res) => {
+  const callSid = req.body?.CallSid;
+  const session = callSessions[callSid];
+  const prompt =
+    session?.prompts?.name ||
+    "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.";
+
+  res.type("text/xml");
+  res.send(premiumSpeak(req, prompt, "/listen-name", session?.config));
 });
 
 app.post("/listen-phone", (req, res) => {
   res.type("text/xml");
-  res.send(premiumListen("/phone"));
+  res.send(premiumListen("/phone", "/repeat-phone"));
+});
+
+app.post("/repeat-phone", (req, res) => {
+  const callSid = req.body?.CallSid;
+  const session = callSessions[callSid];
+  const prompt =
+    session?.prompts?.phone ||
+    "Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.";
+
+  res.type("text/xml");
+  res.send(premiumSpeak(req, prompt, "/listen-phone", session?.config));
 });
 
 app.post("/speech", async (req, res) => {
   const callSid = req.body?.CallSid;
-  const speechText = req.body?.SpeechResult || "";
+  const speechText = (req.body?.SpeechResult || "").trim();
   const session = callSessions[callSid];
 
   console.log("Speech Result:", speechText);
   console.log("Confidence:", req.body?.Confidence);
+
+  res.type("text/xml");
+
+  if (!speechText) {
+    res.send(twimlRedirect(isPremiumMode(session?.config) ? "/repeat-speech" : "/"));
+    return;
+  }
 
   if (session) {
     session.issue = speechText;
@@ -441,11 +483,10 @@ app.post("/speech", async (req, res) => {
   const reply = aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
   const askName = "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.";
 
-  res.type("text/xml");
-
   if (isPremiumMode(session?.config)) {
-    const text = `${reply} ${askName}`;
-    res.send(premiumSpeakThenRedirect(req, text, "/listen-name", session?.config));
+    const prompt = `${reply} ${askName}`;
+    session.prompts.name = prompt;
+    res.send(premiumSpeak(req, prompt, "/listen-name", session?.config));
     return;
   }
 
@@ -459,11 +500,20 @@ app.post("/speech", async (req, res) => {
 
 app.post("/name", (req, res) => {
   const callSid = req.body?.CallSid;
-  const nameText = req.body?.SpeechResult || "";
+  const nameText = (req.body?.SpeechResult || "").trim();
   const session = callSessions[callSid];
 
   console.log("Name Result:", nameText);
   console.log("Name Confidence:", req.body?.Confidence);
+
+  res.type("text/xml");
+
+  if (!nameText) {
+    res.send(
+      twimlRedirect(isPremiumMode(session?.config) ? "/repeat-name" : "/name")
+    );
+    return;
+  }
 
   if (session) {
     session.name = nameText;
@@ -473,10 +523,9 @@ app.post("/name", (req, res) => {
   const askPhone =
     "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.";
 
-  res.type("text/xml");
-
   if (isPremiumMode(session?.config)) {
-    res.send(premiumSpeakThenRedirect(req, askPhone, "/listen-phone", session?.config));
+    session.prompts.phone = askPhone;
+    res.send(premiumSpeak(req, askPhone, "/listen-phone", session?.config));
     return;
   }
 
@@ -489,11 +538,20 @@ app.post("/name", (req, res) => {
 
 app.post("/phone", async (req, res) => {
   const callSid = req.body?.CallSid;
-  const phoneText = req.body?.SpeechResult || "";
+  const phoneText = (req.body?.SpeechResult || "").trim();
   const session = callSessions[callSid];
 
   console.log("Phone Result:", phoneText);
   console.log("Phone Confidence:", req.body?.Confidence);
+
+  res.type("text/xml");
+
+  if (!phoneText) {
+    res.send(
+      twimlRedirect(isPremiumMode(session?.config) ? "/repeat-phone" : "/phone")
+    );
+    return;
+  }
 
   if (session) {
     session.transcript.push(`Telefon Rohtext: ${phoneText}`);
@@ -517,8 +575,6 @@ app.post("/phone", async (req, res) => {
     ["076", "077", "078", "079"].some((p) => phoneDigits.startsWith(p));
 
   if (!usableSwissNumber) {
-    res.type("text/xml");
-
     await sendToLovable(callSid);
 
     const msg =
@@ -538,7 +594,6 @@ app.post("/phone", async (req, res) => {
   ${twilioSay(msg)}
 </Response>
     `.trim());
-
     return;
   }
 
@@ -552,8 +607,6 @@ app.post("/phone", async (req, res) => {
 
   const finalMsg =
     "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen.";
-
-  res.type("text/xml");
 
   if (isPremiumMode(session?.config)) {
     res.send(`
