@@ -28,10 +28,6 @@ function escapeXml(text) {
     .replace(/'/g, "&apos;");
 }
 
-function publicUrl(req) {
-  return `${req.protocol}://${req.get("host")}`;
-}
-
 function signString(value) {
   return crypto
     .createHmac("sha256", process.env.VOICE_WEBHOOK_SECRET || "")
@@ -39,41 +35,15 @@ function signString(value) {
     .digest("hex");
 }
 
-function speechRateToAzure(rate) {
-  if (rate === "slow") return "-15%";
-  if (rate === "fast") return "+12%";
-  return "0%";
+function twilioSay(text) {
+  return `<Say language="de-DE" voice="Polly.Vicki">${escapeXml(text)}</Say>`;
 }
 
-function twilioVoiceFallback(text) {
+function gather(action, text) {
   return `
-<Say language="de-DE" voice="Polly.Vicki">
-  ${escapeXml(text)}
-</Say>
-  `.trim();
-}
-
-function speak(req, text, config) {
-  const provider = config?.voice?.provider || "";
-
-  if (
-    provider.toLowerCase().includes("azure") &&
-    process.env.AZURE_SPEECH_KEY &&
-    process.env.AZURE_SPEECH_REGION
-  ) {
-    const url =
-      `${publicUrl(req)}/tts?text=${encodeURIComponent(text)}` +
-      `&rate=${encodeURIComponent(config?.voice?.speech_rate || "normal")}`;
-
-    return `<Play>${escapeXml(url)}</Play>`;
-  }
-
-  return twilioVoiceFallback(text);
-}
-
-function listen(action) {
-  return `
-<Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST"></Gather>
+<Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST">
+  ${twilioSay(text)}
+</Gather>
   `.trim();
 }
 
@@ -119,7 +89,7 @@ async function callOpenAI(messages) {
   return content.replace(/```json/g, "").replace(/```/g, "").trim();
 }
 
-async function analyzeIssue(text) {
+async function analyzeIssue(text, config) {
   return callOpenAI([
     {
       role: "system",
@@ -134,11 +104,25 @@ emergency
 summary
 reply
 
+Stil:
+- Gesprächsstil: ${config?.voice?.style || "professionell"}
+- Antwortlänge: ${config?.voice?.response_length || "medium"}
+- Freundlichkeit: ${config?.voice?.friendliness || "high"}
+
 Regeln:
 - Du bist die Annahmestelle.
 - Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
 - Bei Notfällen sage: "Ich nehme Ihre Angaben auf und leite es sofort weiter."
 - Frage nicht nach Name oder Telefonnummer.
+
+Notfall:
+- Wasserleck
+- Wasser läuft aus
+- Wasser von der Decke
+- Überschwemmung
+- Rohrbruch
+- Stromausfall
+- Heizung komplett ausgefallen
       `.trim(),
     },
     { role: "user", content: text },
@@ -191,7 +175,8 @@ async function sendToLovable(callSid) {
     caller_phone: session.phone || session.from || null,
     phone_blocks: session.phone_blocks || null,
     intent: session.intent || "sonstiges",
-    problem_summary: session.summary || session.issue || "Anliegen telefonisch erfasst.",
+    problem_summary:
+      session.summary || session.issue || "Anliegen telefonisch erfasst.",
     emergency: Boolean(session.emergency),
     city: null,
     postcode: null,
@@ -234,60 +219,6 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
-app.get("/tts", async (req, res) => {
-  try {
-    const text = req.query.text || "Guten Tag.";
-    const language = "de-DE";
-    const voice = "de-DE-KatjaNeural";
-    const rate = speechRateToAzure(req.query.rate || "normal");
-
-    const ssml = `
-<speak version="1.0" xml:lang="${escapeXml(language)}">
-  <voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}">
-    <prosody rate="${rate}">
-      ${escapeXml(text)}
-    </prosody>
-  </voice>
-</speak>
-    `.trim();
-
-    console.log("Azure TTS Request:", {
-      region: process.env.AZURE_SPEECH_REGION,
-      voice,
-    });
-
-    const azureResponse = await fetch(
-      `https://${process.env.AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`,
-      {
-        method: "POST",
-        headers: {
-          "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
-          "Content-Type": "application/ssml+xml",
-          "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
-          "User-Agent": "anrufwerk-voice-core",
-        },
-        body: ssml,
-      }
-    );
-
-    if (!azureResponse.ok) {
-      console.error("Azure TTS Fehler Status:", azureResponse.status);
-      console.error("Azure TTS Fehler Body:", await azureResponse.text());
-      res.status(500).send("TTS Fehler");
-      return;
-    }
-
-    const audio = Buffer.from(await azureResponse.arrayBuffer());
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-    res.send(audio);
-  } catch (error) {
-    console.error("TTS Fehler:", error.message);
-    res.status(500).send("TTS Fehler");
-  }
-});
-
 app.post("/", async (req, res) => {
   const callSid = req.body?.CallSid;
   const fromNumber = req.body?.From || null;
@@ -319,7 +250,7 @@ app.post("/", async (req, res) => {
   if (!config || config.active !== true) {
     res.send(`
 <Response>
-  ${twilioVoiceFallback("Guten Tag. Der Telefonassistent ist aktuell nicht aktiv.")}
+  ${twilioSay("Guten Tag. Der Telefonassistent ist aktuell nicht aktiv.")}
 </Response>
     `.trim());
     return;
@@ -333,9 +264,7 @@ app.post("/", async (req, res) => {
 
   res.send(`
 <Response>
-  ${speak(req, greeting, config)}
-  <Pause length="1"/>
-  ${listen("/speech")}
+  ${gather("/speech", greeting)}
 </Response>
   `.trim());
 });
@@ -356,7 +285,7 @@ app.post("/speech", async (req, res) => {
   let aiResult = {};
 
   try {
-    const raw = await analyzeIssue(speechText);
+    const raw = await analyzeIssue(speechText, session?.config);
     console.log("AI Raw Result:", raw);
     aiResult = JSON.parse(raw);
   } catch (error) {
@@ -381,11 +310,8 @@ app.post("/speech", async (req, res) => {
 
   res.send(`
 <Response>
-  ${speak(req, reply, session?.config)}
-  <Pause length="1"/>
-  ${speak(req, "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.", session?.config)}
-  <Pause length="1"/>
-  ${listen("/name")}
+  ${twilioSay(reply)}
+  ${gather("/name", "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.")}
 </Response>
   `.trim());
 });
@@ -407,9 +333,10 @@ app.post("/name", (req, res) => {
 
   res.send(`
 <Response>
-  ${speak(req, "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.", session?.config)}
-  <Pause length="1"/>
-  ${listen("/phone")}
+  ${gather(
+    "/phone",
+    "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer."
+  )}
 </Response>
   `.trim());
 });
@@ -448,10 +375,8 @@ app.post("/phone", async (req, res) => {
 
     res.send(`
 <Response>
-  ${speak(
-    req,
-    "Ich konnte die Telefonnummer leider nicht korrekt verstehen. Wir verwenden wenn möglich die angezeigte Anrufernummer.",
-    session?.config
+  ${twilioSay(
+    "Ich konnte die Telefonnummer leider nicht korrekt verstehen. Wir verwenden wenn möglich die angezeigte Anrufernummer."
   )}
 </Response>
     `.trim());
@@ -472,10 +397,8 @@ app.post("/phone", async (req, res) => {
 
   res.send(`
 <Response>
-  ${speak(
-    req,
-    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen.",
-    session?.config
+  ${twilioSay(
+    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen."
   )}
 </Response>
   `.trim());
