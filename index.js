@@ -66,27 +66,16 @@ function speak(req, text, config) {
   const provider =
     config?.voice?.provider || "";
 
-  const voiceId =
-    config?.voice?.voice_id || "";
-
   if (
     provider
       .toLowerCase()
       .includes("azure") &&
-    voiceId &&
     process.env.AZURE_SPEECH_KEY &&
     process.env.AZURE_SPEECH_REGION
   ) {
     const url =
       `${publicUrl(req)}/tts?text=${encodeURIComponent(
         text
-      )}` +
-      `&voice=${encodeURIComponent(
-        voiceId
-      )}` +
-      `&language=${encodeURIComponent(
-        config?.voice?.language ||
-          "de-CH"
       )}` +
       `&rate=${encodeURIComponent(
         config?.voice
@@ -107,19 +96,6 @@ function speak(req, text, config) {
 async function loadVoiceConfig(
   toNumber
 ) {
-  if (
-    !process.env
-      .VOICE_CONFIG_URL ||
-    !process.env
-      .VOICE_WEBHOOK_SECRET
-  ) {
-    console.log(
-      "VOICE_CONFIG_URL oder VOICE_WEBHOOK_SECRET fehlt."
-    );
-
-    return null;
-  }
-
   const signature =
     signString(toNumber);
 
@@ -160,7 +136,7 @@ async function loadVoiceConfig(
   } catch (error) {
     console.error(
       "Voice Config JSON Fehler:",
-      text.slice(0, 500)
+      text
     );
 
     return null;
@@ -190,11 +166,6 @@ async function callOpenAI(
   const data =
     await response.json();
 
-  console.log(
-    "FULL OPENAI RESPONSE:",
-    JSON.stringify(data)
-  );
-
   let content =
     data.choices?.[0]
       ?.message?.content ||
@@ -223,28 +194,6 @@ intent
 emergency
 summary
 reply
-
-Stil:
-- Gesprächsstil: ${
-        config?.voice?.style ||
-        "professionell"
-      }
-- Antwortlänge: ${
-        config?.voice
-          ?.response_length ||
-        "medium"
-      }
-- Freundlichkeit: ${
-        config?.voice
-          ?.friendliness ||
-        "high"
-      }
-
-Regeln:
-- Du bist die Annahmestelle.
-- Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
-- Bei Notfällen sage:
-"Ich nehme Ihre Angaben auf und leite es sofort weiter."
       `.trim(),
     },
     {
@@ -388,11 +337,6 @@ async function sendToLovable(
     "Lovable Webhook Status:",
     response.status
   );
-
-  console.log(
-    "Lovable Webhook Response:",
-    await response.text()
-  );
 }
 
 app.get("/", (req, res) => {
@@ -404,17 +348,6 @@ app.get("/", (req, res) => {
 });
 
 app.get(
-  "/health",
-  (req, res) => {
-    res
-      .status(200)
-      .json({
-        status: "ok",
-      });
-  }
-);
-
-app.get(
   "/tts",
   async (req, res) => {
     try {
@@ -422,13 +355,11 @@ app.get(
         req.query.text ||
         "Guten Tag.";
 
-      const voice =
-        req.query.voice ||
-        "de-CH-LeniNeural";
-
       const language =
-        req.query.language ||
-        "de-CH";
+        "de-DE";
+
+      const voice =
+        "de-DE-KatjaNeural";
 
       const rate =
         speechRateToAzure(
@@ -460,8 +391,6 @@ app.get(
               .AZURE_SPEECH_REGION,
 
           voice,
-          language,
-          rate,
         }
       );
 
@@ -600,7 +529,7 @@ app.post(
       res.send(`
 <Response>
   ${twilioVoiceFallback(
-    "Guten Tag. Der Telefonassistent ist aktuell nicht aktiv. Bitte versuchen Sie es später nochmals."
+    "Guten Tag. Der Telefonassistent ist aktuell nicht aktiv."
   )}
 </Response>
       `.trim());
@@ -609,8 +538,6 @@ app.post(
     }
 
     const greeting =
-      config?.routing
-        ?.custom_greeting ||
       `Guten Tag. Sie sprechen mit dem Telefonassistenten von ${
         config?.organization_name ||
         "Anrufwerk"
@@ -634,12 +561,6 @@ app.post(
     )}
 
   </Gather>
-
-  ${speak(
-    req,
-    "Ich habe leider nichts verstanden. Bitte rufen Sie nochmals an.",
-    config
-  )}
 
 </Response>
     `.trim());
@@ -725,213 +646,12 @@ app.post(
     session?.config
   )}
 
-  <Gather
-    input="speech"
-    language="de-CH"
-    speechTimeout="auto"
-    action="/name"
-    method="POST"
-  >
-
-    ${speak(
-      req,
-      "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.",
-      session?.config
-    )}
-
-  </Gather>
-
-  ${speak(
-    req,
-    "Ich habe den Namen leider nicht verstanden.",
-    session?.config
-  )}
-
-  <Redirect method="POST">
-    /ask-phone
-  </Redirect>
-
 </Response>
     `.trim());
-  }
-);
-
-app.post(
-  "/name",
-  (req, res) => {
-    const callSid =
-      req.body?.CallSid;
-
-    const nameText =
-      req.body
-        ?.SpeechResult ||
-      "";
-
-    const session =
-      callSessions[
-        callSid
-      ];
-
-    if (session) {
-      session.name =
-        nameText;
-
-      session.transcript.push(
-        `Name: ${nameText}`
-      );
-    }
-
-    res.type("text/xml");
-
-    res.send(`
-<Response>
-
-  <Redirect method="POST">
-    /ask-phone
-  </Redirect>
-
-</Response>
-    `);
-  }
-);
-
-app.post(
-  "/ask-phone",
-  (req, res) => {
-    const callSid =
-      req.body?.CallSid;
-
-    const session =
-      callSessions[
-        callSid
-      ];
-
-    res.type("text/xml");
-
-    res.send(`
-<Response>
-
-  <Gather
-    input="speech"
-    language="de-CH"
-    speechTimeout="auto"
-    action="/phone"
-    method="POST"
-  >
-
-    ${speak(
-      req,
-      "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.",
-      session?.config
-    )}
-
-  </Gather>
-
-</Response>
-    `);
-  }
-);
-
-app.post(
-  "/phone",
-  async (req, res) => {
-    const callSid =
-      req.body?.CallSid;
-
-    const phoneText =
-      req.body
-        ?.SpeechResult ||
-      "";
-
-    const session =
-      callSessions[
-        callSid
-      ];
-
-    let phoneResult = {};
-
-    try {
-      const rawPhone =
-        await extractPhone(
-          phoneText
-        );
-
-      phoneResult =
-        JSON.parse(
-          rawPhone
-        );
-    } catch {
-      phoneResult = {};
-    }
-
-    const phoneDigits =
-      (
-        phoneResult.phone_digits ||
-        ""
-      ).replace(/\D/g, "");
-
-    const usableSwissNumber =
-      phoneDigits.length ===
-        10 &&
-      [
-        "076",
-        "077",
-        "078",
-        "079",
-      ].some((p) =>
-        phoneDigits.startsWith(
-          p
-        )
-      );
-
-    if (
-      !usableSwissNumber
-    ) {
-      res.type(
-        "text/xml"
-      );
-
-      res.send(`
-<Response>
-
-  ${speak(
-    req,
-    "Ich konnte die Telefonnummer leider nicht korrekt verstehen.",
-    session?.config
-  )}
-
-</Response>
-      `);
-
-      return;
-    }
-
-    if (session) {
-      session.phone =
-        phoneDigits;
-
-      session.phone_blocks =
-        phoneResult.phone_blocks ||
-        null;
-    }
 
     await sendToLovable(
       callSid
     );
-
-    res.type("text/xml");
-
-    res.send(`
-<Response>
-
-  ${speak(
-    req,
-    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen.",
-    session?.config
-  )}
-
-</Response>
-    `);
   }
 );
 
