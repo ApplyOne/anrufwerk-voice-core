@@ -22,27 +22,6 @@ const PORT = process.env.PORT || 8080;
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
 
-function escapeXml(text) {
-  return String(text || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
-
-function publicUrl(req) {
-  return `${req.protocol}://${req.get("host")}`;
-}
-
-function azureSay(req, text) {
-  const url =
-    `${publicUrl(req)}/tts?text=` +
-    encodeURIComponent(text);
-
-  return `<Play>${url}</Play>`;
-}
-
 async function callOpenAI(messages) {
   const response = await fetch(
     "https://api.openai.com/v1/chat/completions",
@@ -100,7 +79,7 @@ Wichtig:
 - Du bist die Annahmestelle.
 - Bei Notfällen sage:
   "Ich nehme Ihre Angaben auf und leite es sofort weiter."
-- Frage NICHT nach Name oder Telefonnummer.
+- Frage NICHT nach Telefonnummer oder Name.
 
 Notfall:
 - Wasserleck
@@ -153,7 +132,7 @@ erkannt wird,
 gib 0794250023 zurück.
 
 Wenn mindestens 9 sinnvolle Ziffern erkannt wurden,
-dann gilt die Nummer als verwendbar.
+gilt die Nummer als verwendbar.
       `.trim(),
     },
     {
@@ -175,78 +154,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.get("/tts", async (req, res) => {
-  const text = req.query.text || "Guten Tag.";
-
-  try {
-    const region =
-      process.env.AZURE_SPEECH_REGION;
-
-    const key =
-      process.env.AZURE_SPEECH_KEY;
-
-    const ssml = `
-<speak version="1.0" xml:lang="de-CH">
-  <voice xml:lang="de-CH" name="de-CH-LeniNeural">
-    <prosody rate="-5%" pitch="+0%">
-      ${escapeXml(text)}
-    </prosody>
-  </voice>
-</speak>
-    `.trim();
-
-    const azureResponse = await fetch(
-      `https://${region}.tts.speech.microsoft.com/cognitiveservices/v1`,
-      {
-        method: "POST",
-        headers: {
-          "Ocp-Apim-Subscription-Key":
-            key,
-          "Content-Type":
-            "application/ssml+xml",
-          "X-Microsoft-OutputFormat":
-            "audio-16khz-128kbitrate-mono-mp3",
-          "User-Agent":
-            "anrufwerk-voice-core",
-        },
-        body: ssml,
-      }
-    );
-
-    if (!azureResponse.ok) {
-      const errorText =
-        await azureResponse.text();
-
-      console.error(
-        "Azure TTS Fehler:",
-        errorText
-      );
-
-      res.status(500).send("TTS Fehler");
-
-      return;
-    }
-
-    const audioBuffer = Buffer.from(
-      await azureResponse.arrayBuffer()
-    );
-
-    res.setHeader(
-      "Content-Type",
-      "audio/mpeg"
-    );
-
-    res.send(audioBuffer);
-  } catch (error) {
-    console.error(
-      "TTS Fehler:",
-      error.message
-    );
-
-    res.status(500).send("TTS Fehler");
-  }
-});
-
 app.post("/", (req, res) => {
   console.log(
     "Twilio Call erhalten:",
@@ -265,29 +172,16 @@ app.post("/", (req, res) => {
     action="/speech"
     method="POST"
   >
-    ${azureSay(
-      req,
-      "Guten Tag. Bitte sagen Sie kurz, was Ihr Anliegen ist."
-    )}
+    <Say language="de-DE" voice="Polly.Vicki">
+      Guten Tag.
+      Bitte sagen Sie kurz, was Ihr Anliegen ist.
+    </Say>
   </Gather>
 
-  <Gather
-    input="speech"
-    language="de-CH"
-    speechTimeout="auto"
-    action="/speech"
-    method="POST"
-  >
-    ${azureSay(
-      req,
-      "Ich habe leider nichts verstanden. Bitte sagen Sie Ihr Anliegen nochmals kurz."
-    )}
-  </Gather>
-
-  ${azureSay(
-    req,
-    "Entschuldigung. Ich konnte Sie nicht verstehen. Bitte versuchen Sie es später nochmals."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Ich habe leider nichts verstanden.
+    Bitte rufen Sie nochmals an.
+  </Say>
 
 </Response>
   `.trim());
@@ -341,7 +235,9 @@ app.post("/speech", async (req, res) => {
   res.send(`
 <Response>
 
-  ${azureSay(req, reply)}
+  <Say language="de-DE" voice="Polly.Vicki">
+    ${reply}
+  </Say>
 
   <Gather
     input="speech"
@@ -350,29 +246,15 @@ app.post("/speech", async (req, res) => {
     action="/name"
     method="POST"
   >
-    ${azureSay(
-      req,
-      "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen."
-    )}
+    <Say language="de-DE" voice="Polly.Vicki">
+      Bitte sagen Sie mir jetzt nur Ihren Vor-
+      und Nachnamen.
+    </Say>
   </Gather>
 
-  <Gather
-    input="speech"
-    language="de-CH"
-    speechTimeout="auto"
-    action="/name"
-    method="POST"
-  >
-    ${azureSay(
-      req,
-      "Ich habe den Namen leider nicht verstanden. Bitte sagen Sie nur Ihren Vor- und Nachnamen."
-    )}
-  </Gather>
-
-  ${azureSay(
-    req,
-    "Ich konnte den Namen leider nicht sicher erfassen. Ich fahre trotzdem fort."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Ich habe den Namen leider nicht verstanden.
+  </Say>
 
   <Redirect method="POST">
     /ask-phone
@@ -422,29 +304,20 @@ app.post("/ask-phone", (req, res) => {
     action="/phone"
     method="POST"
   >
-    ${azureSay(
-      req,
-      "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer. Zum Beispiel: null sieben neun vier zwei fünf null null zwei drei."
-    )}
+    <Say language="de-DE" voice="Polly.Vicki">
+      Danke.
+
+      Bitte sagen Sie Ihre Telefonnummer langsam,
+      Ziffer für Ziffer.
+
+      Zum Beispiel:
+      null sieben neun vier zwei fünf null null zwei drei.
+    </Say>
   </Gather>
 
-  <Gather
-    input="speech"
-    language="de-CH"
-    speechTimeout="auto"
-    action="/phone"
-    method="POST"
-  >
-    ${azureSay(
-      req,
-      "Ich habe die Telefonnummer leider nicht verstanden. Bitte sagen Sie nur die Telefonnummer langsam, Ziffer für Ziffer."
-    )}
-  </Gather>
-
-  ${azureSay(
-    req,
-    "Ich konnte die Telefonnummer leider nicht sicher erfassen. Ihr Anliegen wurde trotzdem aufgenommen."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Ich habe die Telefonnummer leider nicht verstanden.
+  </Say>
 
 </Response>
   `.trim());
@@ -505,12 +378,6 @@ app.post("/phone", async (req, res) => {
       phoneDigits.startsWith("76")
     );
 
-  const readablePhone =
-    phoneResult.phone_blocks &&
-    phoneResult.phone_blocks.length
-      ? phoneResult.phone_blocks.join(" ")
-      : phoneDigits;
-
   console.log(
     "Final usable number:",
     phoneDigits
@@ -523,10 +390,13 @@ app.post("/phone", async (req, res) => {
     res.send(`
 <Response>
 
-  ${azureSay(
-    req,
-    "Vielen Dank. Ich habe Ihre Telefonnummer aufgenommen. Wir melden uns so schnell wie möglich bei Ihnen."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Vielen Dank.
+
+    Ich habe Ihre Telefonnummer aufgenommen.
+
+    Wir melden uns so schnell wie möglich bei Ihnen.
+  </Say>
 
 </Response>
     `.trim());
@@ -546,16 +416,24 @@ app.post("/phone", async (req, res) => {
     action="/phone-final"
     method="POST"
   >
-    ${azureSay(
-      req,
-      "Entschuldigung. Ich habe die Telefonnummer nicht ganz verstanden. Bitte sagen Sie sie nochmals langsam, Ziffer für Ziffer."
-    )}
+    <Say language="de-DE" voice="Polly.Vicki">
+      Entschuldigung.
+
+      Ich habe die Telefonnummer nicht ganz verstanden.
+
+      Bitte sagen Sie sie nochmals langsam,
+      Ziffer für Ziffer.
+    </Say>
   </Gather>
 
-  ${azureSay(
-    req,
-    "Danke. Wir haben Ihr Anliegen aufgenommen. Falls Ihre Telefonnummer nicht vollständig erkannt wurde, verwenden wir wenn möglich die angezeigte Anrufernummer."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Danke.
+
+    Wir haben Ihr Anliegen aufgenommen.
+
+    Falls Ihre Telefonnummer nicht vollständig erkannt wurde,
+    verwenden wir wenn möglich die angezeigte Anrufernummer.
+  </Say>
 
 </Response>
   `.trim());
@@ -578,10 +456,12 @@ app.post("/phone-final", (req, res) => {
   res.send(`
 <Response>
 
-  ${azureSay(
-    req,
-    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen."
-  )}
+  <Say language="de-DE" voice="Polly.Vicki">
+    Vielen Dank.
+
+    Wir haben Ihr Anliegen aufgenommen
+    und melden uns so schnell wie möglich bei Ihnen.
+  </Say>
 
 </Response>
   `.trim());
