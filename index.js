@@ -28,6 +28,10 @@ function escapeXml(text) {
     .replace(/'/g, "&apos;");
 }
 
+function publicUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+
 function signString(value) {
   return crypto
     .createHmac("sha256", process.env.VOICE_WEBHOOK_SECRET || "")
@@ -35,11 +39,40 @@ function signString(value) {
     .digest("hex");
 }
 
+function isElevenPremium(config) {
+  return (
+    config?.voice?.quality_mode === "premium" &&
+    String(config?.voice?.provider || "").toLowerCase().includes("eleven") &&
+    config?.voice?.voice_id &&
+    process.env.ELEVENLABS_API_KEY
+  );
+}
+
 function twilioSay(text) {
   return `<Say language="de-DE" voice="Polly.Vicki">${escapeXml(text)}</Say>`;
 }
 
-function gather(action, text) {
+function speak(req, text, config) {
+  if (isElevenPremium(config)) {
+    const url =
+      `${publicUrl(req)}/tts-elevenlabs?text=${encodeURIComponent(text)}` +
+      `&voice_id=${encodeURIComponent(config.voice.voice_id)}`;
+
+    return `<Play>${escapeXml(url)}</Play>`;
+  }
+
+  return twilioSay(text);
+}
+
+function gather(action, text, req, config) {
+  if (isElevenPremium(config)) {
+    return `
+${speak(req, text, config)}
+<Pause length="1"/>
+<Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST"></Gather>
+    `.trim();
+  }
+
   return `
 <Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST">
   ${twilioSay(text)}
@@ -108,9 +141,12 @@ Stil:
 - Gesprächsstil: ${config?.voice?.style || "professionell"}
 - Antwortlänge: ${config?.voice?.response_length || "medium"}
 - Freundlichkeit: ${config?.voice?.friendliness || "high"}
+- Natürlichkeit: ${config?.voice?.naturalness_level || "standard"}
+- Dialog-Stil: ${config?.voice?.conversation_style || "effizient"}
 
 Regeln:
 - Du bist die Annahmestelle.
+- Antworte kurz und natürlich.
 - Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
 - Bei Notfällen sage: "Ich nehme Ihre Angaben auf und leite es sofort weiter."
 - Frage nicht nach Name oder Telefonnummer.
@@ -219,6 +255,64 @@ app.get("/health", (req, res) => {
   res.status(200).json({ status: "ok" });
 });
 
+app.get("/tts-elevenlabs", async (req, res) => {
+  try {
+    const text = String(req.query.text || "Guten Tag.");
+    const voiceId = String(req.query.voice_id || "");
+
+    if (!process.env.ELEVENLABS_API_KEY || !voiceId) {
+      res.status(500).send("ElevenLabs nicht konfiguriert");
+      return;
+    }
+
+    console.log("ElevenLabs TTS Request:", {
+      voiceId,
+      textLength: text.length,
+    });
+
+    const response = await fetch(
+      `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
+        voiceId
+      )}?optimize_streaming_latency=3&output_format=mp3_22050_32`,
+      {
+        method: "POST",
+        headers: {
+          "xi-api-key": process.env.ELEVENLABS_API_KEY,
+          "Content-Type": "application/json",
+          Accept: "audio/mpeg",
+        },
+        body: JSON.stringify({
+          text,
+          model_id: "eleven_multilingual_v2",
+          voice_settings: {
+            stability: 0.55,
+            similarity_boost: 0.75,
+            style: 0.15,
+            use_speaker_boost: true,
+          },
+        }),
+      }
+    );
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error("ElevenLabs TTS Fehler Status:", response.status);
+      console.error("ElevenLabs TTS Fehler Body:", errorText);
+      res.status(500).send("ElevenLabs TTS Fehler");
+      return;
+    }
+
+    const audio = Buffer.from(await response.arrayBuffer());
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(audio);
+  } catch (error) {
+    console.error("ElevenLabs TTS Fehler:", error.message);
+    res.status(500).send("ElevenLabs TTS Fehler");
+  }
+});
+
 app.post("/", async (req, res) => {
   const callSid = req.body?.CallSid;
   const fromNumber = req.body?.From || null;
@@ -256,6 +350,13 @@ app.post("/", async (req, res) => {
     return;
   }
 
+  console.log("Voice Mode:", {
+    provider: config?.voice?.provider,
+    quality_mode: config?.voice?.quality_mode,
+    elevenlabs_available: config?.voice?.elevenlabs_available,
+    premium_active: isElevenPremium(config),
+  });
+
   const greeting =
     config?.routing?.custom_greeting ||
     `Guten Tag. Sie sprechen mit dem Telefonassistenten von ${
@@ -264,7 +365,7 @@ app.post("/", async (req, res) => {
 
   res.send(`
 <Response>
-  ${gather("/speech", greeting)}
+  ${gather("/speech", greeting, req, config)}
 </Response>
   `.trim());
 });
@@ -310,8 +411,13 @@ app.post("/speech", async (req, res) => {
 
   res.send(`
 <Response>
-  ${twilioSay(reply)}
-  ${gather("/name", "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.")}
+  ${speak(req, reply, session?.config)}
+  ${gather(
+    "/name",
+    "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.",
+    req,
+    session?.config
+  )}
 </Response>
   `.trim());
 });
@@ -335,7 +441,9 @@ app.post("/name", (req, res) => {
 <Response>
   ${gather(
     "/phone",
-    "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer."
+    "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.",
+    req,
+    session?.config
   )}
 </Response>
   `.trim());
@@ -375,8 +483,10 @@ app.post("/phone", async (req, res) => {
 
     res.send(`
 <Response>
-  ${twilioSay(
-    "Ich konnte die Telefonnummer leider nicht korrekt verstehen. Wir verwenden wenn möglich die angezeigte Anrufernummer."
+  ${speak(
+    req,
+    "Ich konnte die Telefonnummer leider nicht korrekt verstehen. Wir verwenden wenn möglich die angezeigte Anrufernummer.",
+    session?.config
   )}
 </Response>
     `.trim());
@@ -397,8 +507,10 @@ app.post("/phone", async (req, res) => {
 
   res.send(`
 <Response>
-  ${twilioSay(
-    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen."
+  ${speak(
+    req,
+    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen.",
+    session?.config
   )}
 </Response>
   `.trim());
