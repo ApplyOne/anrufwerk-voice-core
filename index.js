@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const crypto = require("crypto");
 const fs = require("fs");
 const express = require("express");
 
@@ -14,9 +15,19 @@ if (process.env.GOOGLE_CREDENTIALS_JSON) {
 
 const app = express();
 const PORT = process.env.PORT || 8080;
+const callSessions = {};
 
 app.use(express.urlencoded({ extended: false }));
 app.use(express.json());
+
+function escapeXml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
 
 async function callOpenAI(messages) {
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -36,11 +47,7 @@ async function callOpenAI(messages) {
   console.log("FULL OPENAI RESPONSE:", JSON.stringify(data));
 
   let content = data.choices?.[0]?.message?.content || "{}";
-
-  content = content
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
-    .trim();
+  content = content.replace(/```json/g, "").replace(/```/g, "").trim();
 
   return content;
 }
@@ -69,6 +76,7 @@ Regeln:
 Notfall:
 - Wasserleck
 - Wasser läuft aus
+- Wasser von der Decke
 - Überschwemmung
 - Rohrbruch
 - Stromausfall
@@ -115,6 +123,82 @@ Regeln:
   ]);
 }
 
+function signPayload(payload) {
+  if (!process.env.VOICE_WEBHOOK_SECRET) return null;
+
+  return crypto
+    .createHmac("sha256", process.env.VOICE_WEBHOOK_SECRET)
+    .update(payload)
+    .digest("hex");
+}
+
+async function sendToLovable(callSid) {
+  const session = callSessions[callSid];
+
+  if (!session) {
+    console.log("Keine Session gefunden:", callSid);
+    return;
+  }
+
+  if (!process.env.LOVABLE_WEBHOOK_URL || !process.env.ORGANIZATION_ID) {
+    console.log("Lovable Webhook nicht konfiguriert.");
+    return;
+  }
+
+  const payload = {
+    organization_id: process.env.ORGANIZATION_ID,
+    call_id: callSid,
+    caller_name: session.name || null,
+    caller_phone: session.phone || session.from || null,
+    phone_blocks: session.phone_blocks || null,
+    intent: session.intent || "sonstiges",
+    problem_summary: session.summary || session.issue || "Anliegen telefonisch erfasst.",
+    emergency: Boolean(session.emergency),
+    city: null,
+    postcode: null,
+    postcode_digits: null,
+    street: null,
+    house_number: null,
+    object_details: null,
+    transcript: session.transcript.join("\n"),
+    slot_completion_rate: session.phone ? 0.8 : 0.5,
+    phone_exact_match: Boolean(session.phone_confirmed),
+    postcode_exact_match: null,
+    city_confirmed: null,
+    name_confirmed: Boolean(session.name),
+    english_fallback_detected: false,
+    median_turn_latency_ms: null,
+  };
+
+  const body = JSON.stringify(payload);
+  const signature = signPayload(body);
+
+  const headers = {
+    "Content-Type": "application/json",
+  };
+
+  if (signature) {
+    headers["x-anrufwerk-signature"] = signature;
+  }
+
+  console.log("Sende Call an Lovable:", body);
+
+  try {
+    const response = await fetch(process.env.LOVABLE_WEBHOOK_URL, {
+      method: "POST",
+      headers,
+      body,
+    });
+
+    const text = await response.text();
+
+    console.log("Lovable Webhook Status:", response.status);
+    console.log("Lovable Webhook Response:", text);
+  } catch (error) {
+    console.error("Lovable Webhook Fehler:", error.message);
+  }
+}
+
 app.get("/", (req, res) => {
   res.status(200).send("Anrufwerk Voice Core läuft.");
 });
@@ -124,7 +208,15 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/", (req, res) => {
-  console.log("Twilio Call erhalten:", req.body?.CallSid);
+  const callSid = req.body?.CallSid;
+
+  console.log("Twilio Call erhalten:", callSid);
+
+  callSessions[callSid] = {
+    from: req.body?.From || null,
+    transcript: [],
+    created_at: new Date().toISOString(),
+  };
 
   res.type("text/xml");
 
@@ -144,10 +236,16 @@ app.post("/", (req, res) => {
 });
 
 app.post("/speech", async (req, res) => {
+  const callSid = req.body?.CallSid;
   const speechText = req.body?.SpeechResult || "";
 
   console.log("Speech Result:", speechText);
   console.log("Confidence:", req.body?.Confidence);
+
+  if (callSessions[callSid]) {
+    callSessions[callSid].issue = speechText;
+    callSessions[callSid].transcript.push(`Anliegen: ${speechText}`);
+  }
 
   let aiResult = {};
 
@@ -158,11 +256,20 @@ app.post("/speech", async (req, res) => {
   } catch (error) {
     console.error("OpenAI Fehler:", error.message);
     aiResult = {
+      intent: "sonstiges",
+      emergency: false,
+      summary: speechText,
       reply: "Vielen Dank. Ich nehme Ihr Anliegen auf.",
     };
   }
 
-  const reply = aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
+  if (callSessions[callSid]) {
+    callSessions[callSid].intent = aiResult.intent || "sonstiges";
+    callSessions[callSid].emergency = Boolean(aiResult.emergency);
+    callSessions[callSid].summary = aiResult.summary || speechText;
+  }
+
+  const reply = escapeXml(aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.");
 
   res.type("text/xml");
 
@@ -188,10 +295,16 @@ app.post("/speech", async (req, res) => {
 });
 
 app.post("/name", (req, res) => {
+  const callSid = req.body?.CallSid;
   const nameText = req.body?.SpeechResult || "";
 
   console.log("Name Result:", nameText);
   console.log("Name Confidence:", req.body?.Confidence);
+
+  if (callSessions[callSid]) {
+    callSessions[callSid].name = nameText;
+    callSessions[callSid].transcript.push(`Name: ${nameText}`);
+  }
 
   res.type("text/xml");
 
@@ -222,10 +335,15 @@ app.post("/ask-phone", (req, res) => {
 });
 
 app.post("/phone", async (req, res) => {
+  const callSid = req.body?.CallSid;
   const phoneText = req.body?.SpeechResult || "";
 
   console.log("Phone Result:", phoneText);
   console.log("Phone Confidence:", req.body?.Confidence);
+
+  if (callSessions[callSid]) {
+    callSessions[callSid].transcript.push(`Telefon Rohtext: ${phoneText}`);
+  }
 
   let phoneResult = {};
 
@@ -275,6 +393,11 @@ app.post("/phone", async (req, res) => {
     return;
   }
 
+  if (callSessions[callSid]) {
+    callSessions[callSid].phone = phoneDigits;
+    callSessions[callSid].phone_blocks = phoneResult.phone_blocks || null;
+  }
+
   const readablePhone = phoneDigits.split("").join(" ");
 
   res.type("text/xml");
@@ -297,38 +420,21 @@ app.post("/phone", async (req, res) => {
 });
 
 app.post("/phone-final", async (req, res) => {
+  const callSid = req.body?.CallSid;
   const phoneText = req.body?.SpeechResult || "";
 
   console.log("Final phone attempt:", phoneText);
   console.log("Final phone confidence:", req.body?.Confidence);
 
-  let phoneResult = {};
-
-  try {
-    const rawPhone = await extractPhone(phoneText);
-    console.log("Final Phone AI Raw Result:", rawPhone);
-    phoneResult = JSON.parse(rawPhone);
-    console.log("Final Phone Extracted:", JSON.stringify(phoneResult));
-  } catch (error) {
-    console.error("Final Phone Extraction Fehler:", error.message);
-    phoneResult = {};
+  if (callSessions[callSid]) {
+    callSessions[callSid].transcript.push(`Telefon finaler Versuch: ${phoneText}`);
   }
 
-  const phoneDigits = (phoneResult.phone_digits || "").replace(/\D/g, "");
+  res.type("text/xml");
 
-  const usableSwissNumber =
-    phoneDigits.length === 10 &&
-    (
-      phoneDigits.startsWith("076") ||
-      phoneDigits.startsWith("077") ||
-      phoneDigits.startsWith("078") ||
-      phoneDigits.startsWith("079")
-    );
+  await sendToLovable(callSid);
 
-  if (!usableSwissNumber) {
-    res.type("text/xml");
-
-    res.send(`
+  res.send(`
 <Response>
   <Say language="de-DE" voice="Polly.Vicki">
     Vielen Dank. Wir haben Ihr Anliegen aufgenommen.
@@ -336,33 +442,11 @@ app.post("/phone-final", async (req, res) => {
     verwenden wir wenn möglich die angezeigte Anrufernummer.
   </Say>
 </Response>
-    `.trim());
-
-    return;
-  }
-
-  const readablePhone = phoneDigits.split("").join(" ");
-
-  res.type("text/xml");
-
-  res.send(`
-<Response>
-  <Gather input="speech" language="de-CH" speechTimeout="auto" action="/confirm-phone?phone=${phoneDigits}" method="POST">
-    <Say language="de-DE" voice="Polly.Vicki">
-      Ich habe folgende Telefonnummer verstanden:
-      ${readablePhone}.
-      Ist das korrekt? Bitte sagen Sie Ja oder Nein.
-    </Say>
-  </Gather>
-
-  <Say language="de-DE" voice="Polly.Vicki">
-    Vielen Dank. Wir haben Ihr Anliegen aufgenommen.
-  </Say>
-</Response>
   `.trim());
 });
 
-app.post("/confirm-phone", (req, res) => {
+app.post("/confirm-phone", async (req, res) => {
+  const callSid = req.body?.CallSid;
   const confirmation = (req.body?.SpeechResult || "").toLowerCase();
   const phone = req.query.phone || "";
 
@@ -375,9 +459,20 @@ app.post("/confirm-phone", (req, res) => {
     confirmation.includes("stimmt") ||
     confirmation.includes("richtig");
 
+  if (callSessions[callSid]) {
+    callSessions[callSid].phone_confirmed = isYes;
+    callSessions[callSid].transcript.push(`Telefon bestätigt: ${confirmation}`);
+
+    if (isYes && phone) {
+      callSessions[callSid].phone = phone;
+    }
+  }
+
   res.type("text/xml");
 
   if (isYes) {
+    await sendToLovable(callSid);
+
     res.send(`
 <Response>
   <Say language="de-DE" voice="Polly.Vicki">
