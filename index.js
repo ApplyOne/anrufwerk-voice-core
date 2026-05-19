@@ -7,7 +7,6 @@ const express = require("express");
 console.log("Anrufwerk Voice Core startet...");
 
 const googlePath = "/tmp/google.json";
-
 if (process.env.GOOGLE_CREDENTIALS_JSON) {
   fs.writeFileSync(googlePath, process.env.GOOGLE_CREDENTIALS_JSON);
   process.env.GOOGLE_APPLICATION_CREDENTIALS = googlePath;
@@ -72,27 +71,20 @@ function speak(req, text, config) {
   return twilioVoiceFallback(text);
 }
 
-function gather(req, action, text, config) {
+function listen(action) {
   return `
-<Gather input="speech" language="de-CH" timeout="5" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST">
-  ${speak(req, text, config)}
-</Gather>
+<Gather input="speech" language="de-CH" timeout="6" speechTimeout="auto" actionOnEmptyResult="true" action="${action}" method="POST"></Gather>
   `.trim();
 }
 
 async function loadVoiceConfig(toNumber) {
   const signature = signString(toNumber);
-
-  const url =
-    `${process.env.VOICE_CONFIG_URL}?to_number=` +
-    encodeURIComponent(toNumber);
+  const url = `${process.env.VOICE_CONFIG_URL}?to_number=${encodeURIComponent(toNumber)}`;
 
   console.log("Lade Voice Config für:", toNumber);
 
   const response = await fetch(url, {
-    headers: {
-      "x-anrufwerk-signature": signature,
-    },
+    headers: { "x-anrufwerk-signature": signature },
   });
 
   const text = await response.text();
@@ -101,7 +93,7 @@ async function loadVoiceConfig(toNumber) {
     const data = JSON.parse(text);
     console.log("Voice Config geladen:", JSON.stringify(data));
     return data;
-  } catch (error) {
+  } catch {
     console.error("Voice Config JSON Fehler:", text.slice(0, 500));
     return null;
   }
@@ -122,13 +114,12 @@ async function callOpenAI(messages) {
   });
 
   const data = await response.json();
-
   let content = data.choices?.[0]?.message?.content || "{}";
 
   return content.replace(/```json/g, "").replace(/```/g, "").trim();
 }
 
-async function analyzeIssue(text, config) {
+async function analyzeIssue(text) {
   return callOpenAI([
     {
       role: "system",
@@ -150,10 +141,7 @@ Regeln:
 - Frage nicht nach Name oder Telefonnummer.
       `.trim(),
     },
-    {
-      role: "user",
-      content: text,
-    },
+    { role: "user", content: text },
   ]);
 }
 
@@ -188,57 +176,36 @@ Regeln:
 - neun = 9
       `.trim(),
     },
-    {
-      role: "user",
-      content: text,
-    },
+    { role: "user", content: text },
   ]);
 }
 
 async function sendToLovable(callSid) {
   const session = callSessions[callSid];
-
   if (!session || !process.env.LOVABLE_WEBHOOK_URL) return;
 
   const payload = {
     organization_id: session.organization_id,
-
     call_id: callSid,
-
     caller_name: session.name || null,
-
     caller_phone: session.phone || session.from || null,
-
     phone_blocks: session.phone_blocks || null,
-
     intent: session.intent || "sonstiges",
-
-    problem_summary:
-      session.summary || session.issue || "Anliegen telefonisch erfasst.",
-
+    problem_summary: session.summary || session.issue || "Anliegen telefonisch erfasst.",
     emergency: Boolean(session.emergency),
-
     city: null,
     postcode: null,
     postcode_digits: null,
     street: null,
     house_number: null,
     object_details: null,
-
     transcript: session.transcript.join("\n"),
-
     slot_completion_rate: session.phone ? 0.8 : 0.5,
-
     phone_exact_match: Boolean(session.phone_confirmed),
-
     postcode_exact_match: false,
-
     city_confirmed: false,
-
     name_confirmed: Boolean(session.name),
-
     english_fallback_detected: false,
-
     median_turn_latency_ms: 0,
   };
 
@@ -270,7 +237,6 @@ app.get("/health", (req, res) => {
 app.get("/tts", async (req, res) => {
   try {
     const text = req.query.text || "Guten Tag.";
-
     const language = "de-DE";
     const voice = "de-DE-KatjaNeural";
     const rate = speechRateToAzure(req.query.rate || "normal");
@@ -305,11 +271,8 @@ app.get("/tts", async (req, res) => {
     );
 
     if (!azureResponse.ok) {
-      const errorText = await azureResponse.text();
-
       console.error("Azure TTS Fehler Status:", azureResponse.status);
-      console.error("Azure TTS Fehler Body:", errorText);
-
+      console.error("Azure TTS Fehler Body:", await azureResponse.text());
       res.status(500).send("TTS Fehler");
       return;
     }
@@ -318,11 +281,9 @@ app.get("/tts", async (req, res) => {
 
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
-
     res.send(audio);
   } catch (error) {
     console.error("TTS Fehler:", error.message);
-
     res.status(500).send("TTS Fehler");
   }
 });
@@ -358,12 +319,9 @@ app.post("/", async (req, res) => {
   if (!config || config.active !== true) {
     res.send(`
 <Response>
-  ${twilioVoiceFallback(
-    "Guten Tag. Der Telefonassistent ist aktuell nicht aktiv."
-  )}
+  ${twilioVoiceFallback("Guten Tag. Der Telefonassistent ist aktuell nicht aktiv.")}
 </Response>
     `.trim());
-
     return;
   }
 
@@ -375,7 +333,9 @@ app.post("/", async (req, res) => {
 
   res.send(`
 <Response>
-  ${gather(req, "/speech", greeting, config)}
+  ${speak(req, greeting, config)}
+  <Pause length="1"/>
+  ${listen("/speech")}
 </Response>
   `.trim());
 });
@@ -396,12 +356,11 @@ app.post("/speech", async (req, res) => {
   let aiResult = {};
 
   try {
-    const raw = await analyzeIssue(speechText, session?.config);
+    const raw = await analyzeIssue(speechText);
     console.log("AI Raw Result:", raw);
     aiResult = JSON.parse(raw);
   } catch (error) {
     console.error("OpenAI Analyse Fehler:", error.message);
-
     aiResult = {
       intent: "sonstiges",
       emergency: false,
@@ -416,21 +375,17 @@ app.post("/speech", async (req, res) => {
     session.summary = aiResult.summary || speechText;
   }
 
-  const reply =
-    aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
+  const reply = aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
 
   res.type("text/xml");
 
   res.send(`
 <Response>
   ${speak(req, reply, session?.config)}
-
-  ${gather(
-    req,
-    "/name",
-    "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.",
-    session?.config
-  )}
+  <Pause length="1"/>
+  ${speak(req, "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.", session?.config)}
+  <Pause length="1"/>
+  ${listen("/name")}
 </Response>
   `.trim());
 });
@@ -452,12 +407,9 @@ app.post("/name", (req, res) => {
 
   res.send(`
 <Response>
-  ${gather(
-    req,
-    "/phone",
-    "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.",
-    session?.config
-  )}
+  ${speak(req, "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer.", session?.config)}
+  <Pause length="1"/>
+  ${listen("/phone")}
 </Response>
   `.trim());
 });
