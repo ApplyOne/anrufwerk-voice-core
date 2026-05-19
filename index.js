@@ -7,7 +7,6 @@ const express = require("express");
 console.log("Anrufwerk Voice Core startet...");
 
 const googlePath = "/tmp/google.json";
-
 if (process.env.GOOGLE_CREDENTIALS_JSON) {
   fs.writeFileSync(googlePath, process.env.GOOGLE_CREDENTIALS_JSON);
   process.env.GOOGLE_APPLICATION_CREDENTIALS = googlePath;
@@ -29,6 +28,10 @@ function escapeXml(text) {
     .replace(/'/g, "&apos;");
 }
 
+function publicUrl(req) {
+  return `${req.protocol}://${req.get("host")}`;
+}
+
 function signString(value) {
   return crypto
     .createHmac("sha256", process.env.VOICE_WEBHOOK_SECRET || "")
@@ -36,11 +39,13 @@ function signString(value) {
     .digest("hex");
 }
 
-function signPayload(payload) {
-  return signString(payload);
+function speechRateToAzure(rate) {
+  if (rate === "slow") return "-15%";
+  if (rate === "fast") return "+12%";
+  return "0%";
 }
 
-function twilioSay(text) {
+function twilioVoiceFallback(text) {
   return `
 <Say language="de-DE" voice="Polly.Vicki">
   ${escapeXml(text)}
@@ -48,14 +53,31 @@ function twilioSay(text) {
   `.trim();
 }
 
-async function loadVoiceConfig(toNumber) {
-  if (!process.env.VOICE_CONFIG_URL) {
-    console.log("VOICE_CONFIG_URL fehlt.");
-    return null;
+function speak(req, text, config) {
+  const provider = config?.voice?.provider || "";
+  const voiceId = config?.voice?.voice_id || "";
+
+  if (
+    provider.toLowerCase().includes("azure") &&
+    voiceId &&
+    process.env.AZURE_SPEECH_KEY &&
+    process.env.AZURE_SPEECH_REGION
+  ) {
+    const url =
+      `${publicUrl(req)}/tts?text=${encodeURIComponent(text)}` +
+      `&voice=${encodeURIComponent(voiceId)}` +
+      `&language=${encodeURIComponent(config?.voice?.language || "de-CH")}` +
+      `&rate=${encodeURIComponent(config?.voice?.speech_rate || "normal")}`;
+
+    return `<Play>${escapeXml(url)}</Play>`;
   }
 
-  if (!process.env.VOICE_WEBHOOK_SECRET) {
-    console.log("VOICE_WEBHOOK_SECRET fehlt.");
+  return twilioVoiceFallback(text);
+}
+
+async function loadVoiceConfig(toNumber) {
+  if (!process.env.VOICE_CONFIG_URL || !process.env.VOICE_WEBHOOK_SECRET) {
+    console.log("VOICE_CONFIG_URL oder VOICE_WEBHOOK_SECRET fehlt.");
     return null;
   }
 
@@ -67,17 +89,19 @@ async function loadVoiceConfig(toNumber) {
   console.log("Lade Voice Config für:", toNumber);
 
   const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "x-anrufwerk-signature": signature,
-    },
+    headers: { "x-anrufwerk-signature": signature },
   });
 
-  const data = await response.json();
+  const text = await response.text();
 
-  console.log("Voice Config geladen:", JSON.stringify(data));
-
-  return data;
+  try {
+    const data = JSON.parse(text);
+    console.log("Voice Config geladen:", JSON.stringify(data));
+    return data;
+  } catch (error) {
+    console.error("Voice Config JSON Fehler:", text.slice(0, 500));
+    return null;
+  }
 }
 
 async function callOpenAI(messages) {
@@ -95,24 +119,13 @@ async function callOpenAI(messages) {
   });
 
   const data = await response.json();
-
   console.log("FULL OPENAI RESPONSE:", JSON.stringify(data));
 
   let content = data.choices?.[0]?.message?.content || "{}";
-
-  content = content
-    .replace(/```json/g, "")
-    .replace(/```/g, "")
-    .trim();
-
-  return content;
+  return content.replace(/```json/g, "").replace(/```/g, "").trim();
 }
 
 async function analyzeIssue(text, config) {
-  const style = config?.voice?.style || "professionell";
-  const responseLength = config?.voice?.response_length || "medium";
-  const friendliness = config?.voice?.friendliness || "high";
-
   return callOpenAI([
     {
       role: "system",
@@ -128,30 +141,18 @@ summary
 reply
 
 Stil:
-- Gesprächsstil: ${style}
-- Antwortlänge: ${responseLength}
-- Freundlichkeit: ${friendliness}
+- Gesprächsstil: ${config?.voice?.style || "professionell"}
+- Antwortlänge: ${config?.voice?.response_length || "medium"}
+- Freundlichkeit: ${config?.voice?.friendliness || "high"}
 
 Regeln:
 - Du bist die Annahmestelle.
 - Sage nie, dass der Kunde selbst einen Techniker kontaktieren soll.
 - Bei Notfällen sage: "Ich nehme Ihre Angaben auf und leite es sofort weiter."
 - Frage nicht nach Name oder Telefonnummer.
-
-Notfall:
-- Wasserleck
-- Wasser läuft aus
-- Wasser von der Decke
-- Überschwemmung
-- Rohrbruch
-- Stromausfall
-- Heizung komplett ausgefallen
       `.trim(),
     },
-    {
-      role: "user",
-      content: text,
-    },
+    { role: "user", content: text },
   ]);
 }
 
@@ -184,96 +185,56 @@ Regeln:
 - sieben = 7
 - acht = 8
 - neun = 9
-- Beispiel: "null sieben neun vier zwei fünf null null zwei drei" = 0794250023
       `.trim(),
     },
-    {
-      role: "user",
-      content: text,
-    },
+    { role: "user", content: text },
   ]);
 }
 
 async function sendToLovable(callSid) {
   const session = callSessions[callSid];
-
-  if (!session) {
-    console.log("Keine Session gefunden:", callSid);
-    return;
-  }
-
-  if (!process.env.LOVABLE_WEBHOOK_URL || !process.env.VOICE_WEBHOOK_SECRET) {
-    console.log("Lovable Webhook nicht konfiguriert.");
-    return;
-  }
+  if (!session || !process.env.LOVABLE_WEBHOOK_URL) return;
 
   const payload = {
-    organization_id:
-      session.organization_id || process.env.ORGANIZATION_ID || null,
-
+    organization_id: session.organization_id,
     call_id: callSid,
-
     caller_name: session.name || null,
-
     caller_phone: session.phone || session.from || null,
-
     phone_blocks: session.phone_blocks || null,
-
     intent: session.intent || "sonstiges",
-
-    problem_summary:
-      session.summary || session.issue || "Anliegen telefonisch erfasst.",
-
+    problem_summary: session.summary || session.issue || "Anliegen telefonisch erfasst.",
     emergency: Boolean(session.emergency),
-
     city: null,
     postcode: null,
     postcode_digits: null,
     street: null,
     house_number: null,
     object_details: null,
-
     transcript: session.transcript.join("\n"),
-
     slot_completion_rate: session.phone ? 0.8 : 0.5,
-
     phone_exact_match: Boolean(session.phone_confirmed),
-
     postcode_exact_match: false,
-
     city_confirmed: false,
-
     name_confirmed: Boolean(session.name),
-
     english_fallback_detected: false,
-
     median_turn_latency_ms: 0,
   };
 
   const body = JSON.stringify(payload);
-  const signature = signPayload(body);
-
-  const headers = {
-    "Content-Type": "application/json",
-    "x-anrufwerk-signature": signature,
-  };
 
   console.log("Sende Call an Lovable:", body);
 
-  try {
-    const response = await fetch(process.env.LOVABLE_WEBHOOK_URL, {
-      method: "POST",
-      headers,
-      body,
-    });
+  const response = await fetch(process.env.LOVABLE_WEBHOOK_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-anrufwerk-signature": signString(body),
+    },
+    body,
+  });
 
-    const text = await response.text();
-
-    console.log("Lovable Webhook Status:", response.status);
-    console.log("Lovable Webhook Response:", text);
-  } catch (error) {
-    console.error("Lovable Webhook Fehler:", error.message);
-  }
+  console.log("Lovable Webhook Status:", response.status);
+  console.log("Lovable Webhook Response:", await response.text());
 }
 
 app.get("/", (req, res) => {
@@ -281,9 +242,53 @@ app.get("/", (req, res) => {
 });
 
 app.get("/health", (req, res) => {
-  res.status(200).json({
-    status: "ok",
-  });
+  res.status(200).json({ status: "ok" });
+});
+
+app.get("/tts", async (req, res) => {
+  try {
+    const text = req.query.text || "Guten Tag.";
+    const voice = req.query.voice || "de-CH-LeniNeural";
+    const language = req.query.language || "de-CH";
+    const rate = speechRateToAzure(req.query.rate || "normal");
+
+    const ssml = `
+<speak version="1.0" xml:lang="${escapeXml(language)}">
+  <voice xml:lang="${escapeXml(language)}" name="${escapeXml(voice)}">
+    <prosody rate="${rate}">
+      ${escapeXml(text)}
+    </prosody>
+  </voice>
+</speak>
+    `.trim();
+
+    const azureResponse = await fetch(
+      `https://${process.env.AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`,
+      {
+        method: "POST",
+        headers: {
+          "Ocp-Apim-Subscription-Key": process.env.AZURE_SPEECH_KEY,
+          "Content-Type": "application/ssml+xml",
+          "X-Microsoft-OutputFormat": "audio-16khz-128kbitrate-mono-mp3",
+          "User-Agent": "anrufwerk-voice-core",
+        },
+        body: ssml,
+      }
+    );
+
+    if (!azureResponse.ok) {
+      console.error("Azure TTS Fehler:", await azureResponse.text());
+      res.status(500).send("TTS Fehler");
+      return;
+    }
+
+    const audio = Buffer.from(await azureResponse.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(audio);
+  } catch (error) {
+    console.error("TTS Fehler:", error.message);
+    res.status(500).send("TTS Fehler");
+  }
 });
 
 app.post("/", async (req, res) => {
@@ -315,34 +320,25 @@ app.post("/", async (req, res) => {
   res.type("text/xml");
 
   if (!config || config.active !== true) {
-    const reason = config?.active_reason || "unavailable";
-
-    console.log("Assistent nicht aktiv:", reason);
-
     res.send(`
 <Response>
-  ${twilioSay(
-    "Guten Tag. Der Telefonassistent ist aktuell nicht aktiv. Bitte versuchen Sie es später nochmals."
-  )}
+  ${twilioVoiceFallback("Guten Tag. Der Telefonassistent ist aktuell nicht aktiv. Bitte versuchen Sie es später nochmals.")}
 </Response>
     `.trim());
-
     return;
   }
 
   const greeting =
     config?.routing?.custom_greeting ||
-    `Guten Tag. Sie sprechen mit dem Telefonassistenten von ${
-      config?.organization_name || "Anrufwerk"
-    }. Bitte sagen Sie kurz, was Ihr Anliegen ist.`;
+    `Guten Tag. Sie sprechen mit dem Telefonassistenten von ${config?.organization_name || "Anrufwerk"}. Bitte sagen Sie kurz, was Ihr Anliegen ist.`;
 
   res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/speech" method="POST">
-    ${twilioSay(greeting)}
+    ${speak(req, greeting, config)}
   </Gather>
 
-  ${twilioSay("Ich habe leider nichts verstanden. Bitte rufen Sie nochmals an.")}
+  ${speak(req, "Ich habe leider nichts verstanden. Bitte rufen Sie nochmals an.", config)}
 </Response>
   `.trim());
 });
@@ -367,8 +363,6 @@ app.post("/speech", async (req, res) => {
     console.log("AI Raw Result:", raw);
     aiResult = JSON.parse(raw);
   } catch (error) {
-    console.error("OpenAI Fehler:", error.message);
-
     aiResult = {
       intent: "sonstiges",
       emergency: false,
@@ -383,20 +377,17 @@ app.post("/speech", async (req, res) => {
     session.summary = aiResult.summary || speechText;
   }
 
-  const reply =
-    aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.";
-
   res.type("text/xml");
 
   res.send(`
 <Response>
-  ${twilioSay(reply)}
+  ${speak(req, aiResult.reply || "Vielen Dank. Ich nehme Ihr Anliegen auf.", session?.config)}
 
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/name" method="POST">
-    ${twilioSay("Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.")}
+    ${speak(req, "Bitte sagen Sie mir jetzt nur Ihren Vor- und Nachnamen.", session?.config)}
   </Gather>
 
-  ${twilioSay("Ich habe den Namen leider nicht verstanden.")}
+  ${speak(req, "Ich habe den Namen leider nicht verstanden.", session?.config)}
 
   <Redirect method="POST">/ask-phone</Redirect>
 </Response>
@@ -406,36 +397,32 @@ app.post("/speech", async (req, res) => {
 app.post("/name", (req, res) => {
   const callSid = req.body?.CallSid;
   const nameText = req.body?.SpeechResult || "";
+  const session = callSessions[callSid];
 
   console.log("Name Result:", nameText);
-  console.log("Name Confidence:", req.body?.Confidence);
 
-  if (callSessions[callSid]) {
-    callSessions[callSid].name = nameText;
-    callSessions[callSid].transcript.push(`Name: ${nameText}`);
+  if (session) {
+    session.name = nameText;
+    session.transcript.push(`Name: ${nameText}`);
   }
 
   res.type("text/xml");
-
-  res.send(`
-<Response>
-  <Redirect method="POST">/ask-phone</Redirect>
-</Response>
-  `.trim());
+  res.send(`<Response><Redirect method="POST">/ask-phone</Redirect></Response>`);
 });
 
 app.post("/ask-phone", (req, res) => {
+  const callSid = req.body?.CallSid;
+  const session = callSessions[callSid];
+
   res.type("text/xml");
 
   res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone" method="POST">
-    ${twilioSay(
-      "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer. Zum Beispiel: null sieben neun vier zwei fünf null null zwei drei."
-    )}
+    ${speak(req, "Danke. Bitte sagen Sie Ihre Telefonnummer langsam, Ziffer für Ziffer. Zum Beispiel: null sieben neun vier zwei fünf null null zwei drei.", session?.config)}
   </Gather>
 
-  ${twilioSay("Ich habe die Telefonnummer leider nicht verstanden.")}
+  ${speak(req, "Ich habe die Telefonnummer leider nicht verstanden.", session?.config)}
 </Response>
   `.trim());
 });
@@ -443,23 +430,21 @@ app.post("/ask-phone", (req, res) => {
 app.post("/phone", async (req, res) => {
   const callSid = req.body?.CallSid;
   const phoneText = req.body?.SpeechResult || "";
+  const session = callSessions[callSid];
 
   console.log("Phone Result:", phoneText);
-  console.log("Phone Confidence:", req.body?.Confidence);
 
-  if (callSessions[callSid]) {
-    callSessions[callSid].transcript.push(`Telefon Rohtext: ${phoneText}`);
+  if (session) {
+    session.transcript.push(`Telefon Rohtext: ${phoneText}`);
   }
 
   let phoneResult = {};
 
   try {
     const rawPhone = await extractPhone(phoneText);
-    console.log("Phone AI Raw Result:", rawPhone);
     phoneResult = JSON.parse(rawPhone);
     console.log("Phone Extracted:", JSON.stringify(phoneResult));
-  } catch (error) {
-    console.error("Phone Extraction Fehler:", error.message);
+  } catch {
     phoneResult = {};
   }
 
@@ -467,14 +452,7 @@ app.post("/phone", async (req, res) => {
 
   const usableSwissNumber =
     phoneDigits.length === 10 &&
-    (
-      phoneDigits.startsWith("076") ||
-      phoneDigits.startsWith("077") ||
-      phoneDigits.startsWith("078") ||
-      phoneDigits.startsWith("079")
-    );
-
-  console.log("Final usable number:", phoneDigits);
+    ["076", "077", "078", "079"].some((p) => phoneDigits.startsWith(p));
 
   if (!usableSwissNumber) {
     res.type("text/xml");
@@ -482,23 +460,18 @@ app.post("/phone", async (req, res) => {
     res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/phone-final" method="POST">
-    ${twilioSay(
-      "Entschuldigung. Ich habe die Telefonnummer nicht ganz verstanden. Bitte sagen Sie sie nochmals langsam, Ziffer für Ziffer."
-    )}
+    ${speak(req, "Entschuldigung. Ich habe die Telefonnummer nicht ganz verstanden. Bitte sagen Sie sie nochmals langsam, Ziffer für Ziffer.", session?.config)}
   </Gather>
 
-  ${twilioSay(
-    "Danke. Wir haben Ihr Anliegen aufgenommen. Falls Ihre Telefonnummer nicht vollständig erkannt wurde, verwenden wir wenn möglich die angezeigte Anrufernummer."
-  )}
+  ${speak(req, "Danke. Wir haben Ihr Anliegen aufgenommen. Falls Ihre Telefonnummer nicht vollständig erkannt wurde, verwenden wir wenn möglich die angezeigte Anrufernummer.", session?.config)}
 </Response>
     `.trim());
-
     return;
   }
 
-  if (callSessions[callSid]) {
-    callSessions[callSid].phone = phoneDigits;
-    callSessions[callSid].phone_blocks = phoneResult.phone_blocks || null;
+  if (session) {
+    session.phone = phoneDigits;
+    session.phone_blocks = phoneResult.phone_blocks || null;
   }
 
   const readablePhone = phoneDigits.split("").join(" ");
@@ -508,12 +481,10 @@ app.post("/phone", async (req, res) => {
   res.send(`
 <Response>
   <Gather input="speech" language="de-CH" speechTimeout="auto" action="/confirm-phone?phone=${phoneDigits}" method="POST">
-    ${twilioSay(
-      `Ich habe folgende Telefonnummer verstanden: ${readablePhone}. Ist das korrekt? Bitte sagen Sie Ja oder Nein.`
-    )}
+    ${speak(req, `Ich habe folgende Telefonnummer verstanden: ${readablePhone}. Ist das korrekt? Bitte sagen Sie Ja oder Nein.`, session?.config)}
   </Gather>
 
-  ${twilioSay("Ich konnte die Bestätigung nicht verstehen.")}
+  ${speak(req, "Ich konnte die Bestätigung nicht verstehen.", session?.config)}
 </Response>
   `.trim());
 });
@@ -521,25 +492,18 @@ app.post("/phone", async (req, res) => {
 app.post("/phone-final", async (req, res) => {
   const callSid = req.body?.CallSid;
   const phoneText = req.body?.SpeechResult || "";
+  const session = callSessions[callSid];
 
-  console.log("Final phone attempt:", phoneText);
-  console.log("Final phone confidence:", req.body?.Confidence);
-
-  if (callSessions[callSid]) {
-    callSessions[callSid].transcript.push(
-      `Telefon finaler Versuch: ${phoneText}`
-    );
+  if (session) {
+    session.transcript.push(`Telefon finaler Versuch: ${phoneText}`);
   }
-
-  res.type("text/xml");
 
   await sendToLovable(callSid);
 
+  res.type("text/xml");
   res.send(`
 <Response>
-  ${twilioSay(
-    "Vielen Dank. Wir haben Ihr Anliegen aufgenommen. Falls Ihre Telefonnummer nicht korrekt erfasst wurde, verwenden wir wenn möglich die angezeigte Anrufernummer."
-  )}
+  ${speak(req, "Vielen Dank. Wir haben Ihr Anliegen aufgenommen. Falls Ihre Telefonnummer nicht korrekt erfasst wurde, verwenden wir wenn möglich die angezeigte Anrufernummer.", session?.config)}
 </Response>
   `.trim());
 });
@@ -548,9 +512,7 @@ app.post("/confirm-phone", async (req, res) => {
   const callSid = req.body?.CallSid;
   const confirmation = (req.body?.SpeechResult || "").toLowerCase();
   const phone = req.query.phone || "";
-
-  console.log("Phone confirmation:", confirmation);
-  console.log("Confirmed phone candidate:", phone);
+  const session = callSessions[callSid];
 
   const isYes =
     confirmation.includes("ja") ||
@@ -558,12 +520,12 @@ app.post("/confirm-phone", async (req, res) => {
     confirmation.includes("stimmt") ||
     confirmation.includes("richtig");
 
-  if (callSessions[callSid]) {
-    callSessions[callSid].phone_confirmed = isYes;
-    callSessions[callSid].transcript.push(`Telefon bestätigt: ${confirmation}`);
+  if (session) {
+    session.phone_confirmed = isYes;
+    session.transcript.push(`Telefon bestätigt: ${confirmation}`);
 
     if (isYes && phone) {
-      callSessions[callSid].phone = phone;
+      session.phone = phone;
     }
   }
 
@@ -574,20 +536,13 @@ app.post("/confirm-phone", async (req, res) => {
 
     res.send(`
 <Response>
-  ${twilioSay(
-    "Perfekt. Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen."
-  )}
+  ${speak(req, "Perfekt. Vielen Dank. Wir haben Ihr Anliegen aufgenommen und melden uns so schnell wie möglich bei Ihnen.", session?.config)}
 </Response>
     `.trim());
-
     return;
   }
 
-  res.send(`
-<Response>
-  <Redirect method="POST">/ask-phone</Redirect>
-</Response>
-  `.trim());
+  res.send(`<Response><Redirect method="POST">/ask-phone</Redirect></Response>`);
 });
 
 app.listen(PORT, "0.0.0.0", () => {
